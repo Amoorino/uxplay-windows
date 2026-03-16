@@ -1,4 +1,5 @@
 name: build uxplay-windows
+
 on:
   push:
     branches:
@@ -6,49 +7,67 @@ on:
   workflow_dispatch:
     inputs:
       tmate_debug_enabled:
-        description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
-        default: false
+        description: Run with tmate debugging enabled if the workflow fails
         required: false
+        default: false
         type: boolean
 
 jobs:
   build:
     name: build uxplay
-    runs-on: windows-latest    
+    runs-on: windows-latest
+    timeout-minutes: 90
+
     permissions:
       contents: write
-    
+
     steps:
-      - name: clone the repo
+      - name: Checkout repository
         uses: actions/checkout@v4
-          
-      - name: download & install Inno Setup
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download and install Inno Setup
+        shell: powershell
         run: |
-          Invoke-WebRequest https://jrsoftware.org/download.php/is.exe -OutFile is.exe
-          start (Join-Path -Path $(Get-Location) -ChildPath "is.exe") /VERYSILENT
-        
-      - name: download+install mDNSResponder libraries
+          Invoke-WebRequest "https://jrsoftware.org/download.php/is.exe" -OutFile "is.exe"
+          Start-Process -FilePath "$PWD\is.exe" -ArgumentList "/VERYSILENT" -Wait
+
+      - name: Download and build mDNSResponder Bonjour SDK library
+        shell: powershell
+        continue-on-error: true
         run: |
           git clone -b rel/mDNSResponder-214 https://github.com/apple-oss-distributions/mDNSResponder.git --depth 1 mdns214
-          cp dnssd.vcxproj mdns214\mDNSWindows\DLL\dnssd.vcxproj
-          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe' mdns214\mDNSWindows\DLL\dnssd.vcxproj /p:Configuration=Release /p:Platform=x64
+          Copy-Item "dnssd.vcxproj" "mdns214\mDNSWindows\DLL\dnssd.vcxproj" -Force
 
-          mkdir "C:\Program Files\Bonjour SDK\Include"
-          mkdir "C:\Program Files\Bonjour SDK\Lib\x64"
-          cp mdns214\mDNSShared\dns_sd.h "C:\Program Files\Bonjour SDK\Include\dns_sd.h"
-          cp mdns214\mDNSWindows\DLL\x64\Release\dnssd.lib "C:\Program Files\Bonjour SDK\Lib\x64\dnssd.lib"
-        # this compiling has errors, but we don't care because all we need is dnssd.lib which gets compiled with no issues
-        continue-on-error: true
+          msbuild "mdns214\mDNSWindows\DLL\dnssd.vcxproj" `
+            /p:Configuration=Release `
+            /p:Platform=x64
 
-      - name: download+install msys2 and related build dependencies
+          New-Item -ItemType Directory -Force -Path "C:\Program Files\Bonjour SDK\Include" | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\Program Files\Bonjour SDK\Lib\x64" | Out-Null
+
+          Copy-Item "mdns214\mDNSShared\dns_sd.h" "C:\Program Files\Bonjour SDK\Include\dns_sd.h" -Force
+          Copy-Item "mdns214\mDNSWindows\DLL\x64\Release\dnssd.lib" "C:\Program Files\Bonjour SDK\Lib\x64\dnssd.lib" -Force
+
+      - name: Set up MSYS2 and build dependencies
+        id: setup-msys2
         uses: msys2/setup-msys2@v2
         with:
           update: true
+          cache: true
           install: >-
             git
             zip
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-ninja
             mingw-w64-x86_64-libplist
             mingw-w64-x86_64-json-glib
             mingw-w64-x86_64-gstreamer
@@ -57,27 +76,26 @@ jobs:
             mingw-w64-x86_64-gst-plugins-good
             mingw-w64-x86_64-gst-plugins-bad
 
-      - name: compiling uxplay (finally)
+      - name: Compile UxPlay
         shell: msys2 {0}
         run: |
-          git clone https://github.com/FDH2/UxPlay && cd UxPlay
-          mkdir build && cd build
-          cmake ..
-          ninja
-          
-          mkdir artifact && cd artifact
-          mkdir lib
-          cp -r /mingw64/lib/gstreamer-1.0 lib/gstreamer-1.0
-          cp -r /mingw64/bin bin
-          cp ../uxplay.exe bin
+          git clone --depth 1 https://github.com/FDH2/UxPlay
+          cd UxPlay
 
-        # remove unnecessary DLLs so we get a smaller installer
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+          mkdir -p build/artifact/lib
+          cp -r /mingw64/lib/gstreamer-1.0 build/artifact/lib/gstreamer-1.0
+          cp -r /mingw64/bin build/artifact/bin
+          cp build/uxplay.exe build/artifact/bin/
+
       - name: Prune compilation artifact directory
+        shell: powershell
         run: |
-          $artifactDir = "D:\a\uxplay-windows\uxplay-windows\UxPlay\build\artifact"
-          $keepListFile = "D:\a\uxplay-windows\uxplay-windows\dll-libs-list.txt"
-          
-          # Read patterns from the keep list (can include wildcards)
+          $artifactDir = Join-Path $PWD "UxPlay\build\artifact"
+          $keepListFile = Join-Path $PWD "dll-libs-list.txt"
+
           $keepPatterns = @()
           Get-Content $keepListFile | ForEach-Object {
               $pattern = $_.Trim()
@@ -85,23 +103,19 @@ jobs:
                   $keepPatterns += $pattern
               }
           }
-      
+
           Write-Host "Total keep patterns: $($keepPatterns.Count)"
-      
-          # Get all files currently existing in the target directory and its subdirectories
+
           $allFilesInTarget = Get-ChildItem -Path $artifactDir -Recurse -File
-      
           Write-Host "Total files found in target directory before pruning: $($allFilesInTarget.Count)"
-      
+
           $deletedCount = 0
           $keptCount = 0
-          
-          # Iterate through all files and check if they match any keep pattern
+
           foreach ($currentFile in $allFilesInTarget) {
               $currentFilePath = $currentFile.FullName
               $shouldKeep = $false
-              
-              # Check if the current file matches any of the keep patterns
+
               foreach ($pattern in $keepPatterns) {
                   if ($currentFilePath -like $pattern) {
                       $shouldKeep = $true
@@ -109,41 +123,47 @@ jobs:
                       break
                   }
               }
-              
+
               if (-not $shouldKeep) {
                   Remove-Item $currentFilePath -Force
                   $deletedCount++
               }
           }
-      
-          Write-Host "Cleanup complete! Kept $keptCount files, deleted $deletedCount files." -ForegroundColor Green
-          Write-Host "`nContents of $artifactDir after pruning:"
-          Get-ChildItem -Path $artifactDir -Recurse | Select-Object FullName
-        shell: powershell
 
-      # compiling the python tray icon into an .exe
-      - name: install pyinstaller and dependencies
+          Write-Host "Cleanup complete! Kept $keptCount files, deleted $deletedCount files." -ForegroundColor Green
+          Write-Host ""
+          Write-Host "Contents of $artifactDir after pruning:"
+          Get-ChildItem -Path $artifactDir -Recurse | Select-Object FullName
+
+      - name: Build tray app with PyInstaller
+        shell: powershell
         run: |
-          python -m venv ./venv
+          python -m venv .\venv
           .\venv\Scripts\Activate.ps1
           python -m pip install --upgrade pip
           pip install pyinstaller pystray
 
           pyinstaller --noconsole --onedir --clean --name uxplay-windows --icon=icon.ico tray.py
 
-          cp -r D:\a\uxplay-windows\uxplay-windows\UxPlay\build\artifact\* D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal
-          cp D:\a\uxplay-windows\uxplay-windows\icon.ico D:\a\uxplay-windows\uxplay-windows\dist\uxplay-windows\_internal
-          
-      - name: compile the installer with inno setup
-        run: .$(Join-Path -Path ${env:PROGRAMFILES(X86)} -ChildPath 'Inno Setup 6\\ISCC.exe') $(Join-Path -Path $(Get-Location) -ChildPath "script.iss")
-        
-      - name: uploading artifact
+          New-Item -ItemType Directory -Force -Path "dist\uxplay-windows\_internal" | Out-Null
+          Copy-Item -Path "UxPlay\build\artifact\*" -Destination "dist\uxplay-windows\_internal" -Recurse -Force
+          Copy-Item -Path "icon.ico" -Destination "dist\uxplay-windows\_internal\icon.ico" -Force
+
+      - name: Compile installer with Inno Setup
+        shell: powershell
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "$PWD\script.iss"
+
+      - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: uxplay-windows
           path: Output\uxplay-windows.exe
 
-      # move this between steps for debugging
-      - name: (optional) Setup tmate session
+      - name: Setup tmate session on failure
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.tmate_debug_enabled }}
         uses: mxschmitt/action-tmate@v3
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tmate_debug_enabled }}
+        timeout-minutes: 15
+        with:
+          limit-access-to-actor: true
+          msys2-location: ${{ steps.setup-msys2.outputs.msys2-location }}
